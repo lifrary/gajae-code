@@ -1,0 +1,106 @@
+name: Qualify paused-goal Darwin candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      control_sha:
+        description: Exact reviewed control-workflow commit (not the runtime source)
+        required: true
+        type: string
+      source_sha:
+        description: Frozen independently approved runtime source
+        required: true
+        type: choice
+        options:
+          - 27dd04bc8f90333a16cf3c385fb65278b71bc4a4
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qualify-paused-goal-darwin
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.repository == 'lifrary/gajae-code' &&
+      github.event.repository.private == false &&
+      github.run_attempt == 1 &&
+      inputs.control_sha == github.sha &&
+      inputs.source_sha == '27dd04bc8f90333a16cf3c385fb65278b71bc4a4'
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      CONTROL_SHA: ${{ github.sha }}
+      SOURCE_SHA: 27dd04bc8f90333a16cf3c385fb65278b71bc4a4
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      NUM_JOBS: "2"
+      CMAKE_BUILD_PARALLEL_LEVEL: "2"
+      MAKEFLAGS: -j2
+      RAYON_NUM_THREADS: "2"
+      UV_THREADPOOL_SIZE: "2"
+      GOMAXPROCS: "2"
+      NODE_OPTIONS: --max-old-space-size=1536
+    steps:
+      - name: Start whole-job budget
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, time
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'paused-goal-qualification'
+          root.mkdir(exist_ok=False)
+          (root / 'started.json').write_text(json.dumps({'monotonic': time.monotonic()}))
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write(f'QUALIFICATION_ROOT={root}\n')
+          PY
+      - name: Checkout reviewed control revision
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.control_sha }}
+          path: control
+          persist-credentials: false
+      - name: Checkout frozen runtime source independently
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: lifrary/gajae-code
+          ref: 27dd04bc8f90333a16cf3c385fb65278b71bc4a4
+          path: source
+          persist-credentials: false
+      - name: Refuse unsuitable runner or starting capacity
+        run: python3 control/.github/scripts/qualify_paused_goal_darwin.py preflight source
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        timeout-minutes: 3
+        with:
+          node-version: "24"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        timeout-minutes: 3
+        with:
+          bun-version: 1.4.0
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2
+        timeout-minutes: 5
+        with:
+          toolchain: nightly-2026-08-12
+      - name: Build and qualify under sampled resource limits
+        run: python3 control/.github/scripts/qualify_paused_goal_darwin.py qualify source
+      - name: Seal bounded outcome before upload
+        id: seal
+        if: ${{ always() && !cancelled() }}
+        timeout-minutes: 1
+        env:
+          QUALIFICATION_JOB_STATUS: ${{ job.status }}
+        run: python3 control/.github/scripts/qualify_paused_goal_darwin.py seal source
+      - name: Upload bounded success bundle or failure evidence
+        if: ${{ always() && !cancelled() && steps.seal.outcome == 'success' }}
+        timeout-minutes: 3
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: paused-goal-darwin-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/paused-goal-qualification/upload
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          include-hidden-files: true
+          overwrite: false
