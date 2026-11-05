@@ -6,12 +6,13 @@ import io
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 spec = importlib.util.spec_from_file_location("guard", Path(__file__).with_name("qualify_paused_goal_darwin.py"))
 guard = importlib.util.module_from_spec(spec)
@@ -147,10 +148,15 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(receipt["cleanup_errors"], [])
 
     def test_deadline_stops_only_owned_process(self):
-        unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(1)"], start_new_session=True)
+        unrelated = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
+                                     stdin=subprocess.PIPE, start_new_session=True)
         try:
             with self.assertRaisesRegex(guard.Refusal, "deadline") as caught:
-                self.run_child("import os,time; print(os.getpid(),flush=True); time.sleep(1)", deadline=time.monotonic() + 0.2)
+                self.run_child(
+                    "from pathlib import Path; import time; end=time.monotonic()+10; "
+                    "exec(\"while not Path('deadline-release').exists() and time.monotonic()<end: time.sleep(0.01)\")",
+                    deadline=time.monotonic() + 0.2,
+                )
             stage = caught.exception.primary_stage
             self.assertTrue(stage["process_started"])
             self.assertIsNone(stage["exit_code"])
@@ -159,10 +165,12 @@ class GuardTests(unittest.TestCase):
             self.assertEqual(stage["cleanup"]["observed_exit_code"], -9)
             self.assertEqual(stage["cleanup"]["observed_signal"], 9)
             self.assertIsNone(unrelated.poll())
-            pid = int(self.log.read_text().strip())
+            pid = stage["root_pid"]  # Deadline may precede the first stdout drain.
             with self.assertRaises(ProcessLookupError):
                 os.kill(pid, 0)
         finally:
+            (self.root / "deadline-release").touch()
+            unrelated.stdin.close()
             unrelated.wait(timeout=3)
 
     def test_memory_limit_refuses_actual_child(self):
@@ -194,25 +202,102 @@ class GuardTests(unittest.TestCase):
             self.run_child("print('must not start')", deadline=time.monotonic() - 1)
         self.assertFalse(self.log.exists())
 
-    def test_tree_sampler_includes_children_outside_group(self):
-        rows = {10: (1, 10, 20, "birth-a", "parent"),
-                11: (10, 11, 30, "birth-b", "escaped"),
-                12: (11, 11, 40, "birth-c", "child"),
-                15: (1, 15, 50, "birth-d", "unrelated")}
-        self.assertEqual(set(guard.owned_tree(10, rows)), {10, 11, 12})
-
-    def test_escaped_descendant_is_refused_and_stopped(self):
+    def test_detached_descendant_is_bound_and_settled(self):
         script = (
             "import subprocess,sys; "
-            "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(1)'],start_new_session=True); "
+            "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(0.4)'],start_new_session=True); "
             "print(p.pid,flush=True); p.wait()"
         )
-        with self.assertRaisesRegex(guard.Refusal, "escaped"):
-            self.run_child(script)
+        self.run_child(script)
         child = int(self.log.read_text().strip())
         result = subprocess.run(["ps", "-p", str(child), "-o", "stat="], capture_output=True, text=True)
         self.assertTrue(result.returncode == 1 or result.stdout.strip().startswith("Z"),
-                        "escaped fixture must not remain executable")
+                        "detached fixture must not remain executable")
+        receipt = json.loads(Path(str(self.log) + ".json").read_text())
+        self.assertEqual(receipt["exit_code"], 0)
+        self.assertEqual(receipt["peak_sampled_processes"], 2)
+        self.assertGreaterEqual(receipt["ownership"]["settled_count"], 2)
+        self.assertEqual(receipt["cleanup_errors"], [])
+
+    def test_root_exit_keeps_detached_child_accounted_until_settlement(self):
+        child_script = (
+            "from pathlib import Path; import time; end=time.monotonic()+2; "
+            "exec(\"while not Path('child-release').exists() and time.monotonic()<end: time.sleep(0.005)\")"
+        )
+        script = (
+            "import subprocess,sys,time; from pathlib import Path; "
+            f"p=subprocess.Popen([sys.executable,'-B','-c',{child_script!r}],"
+            "start_new_session=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+            "print(p.pid,flush=True); end=time.monotonic()+2.5; "
+            "exec(\"while not Path('root-release').exists() and time.monotonic()<end: time.sleep(0.005)\")"
+        )
+        sample = guard.OwnedProcesses.sample
+        bound_child = {}
+        orphan_samples = []
+
+        def release_when_bound(owner, deadline):
+            live, names = sample(owner, deadline)
+            for pid, info in live.items():
+                if pid != owner.root:
+                    bound_child[pid] = info
+            if bound_child:
+                (self.root / "root-release").touch()
+            if owner.root not in live and live:
+                orphan_samples.append(dict(live))
+                (self.root / "child-release").touch()
+            return live, names
+
+        try:
+            with patch.object(guard.OwnedProcesses, "sample", release_when_bound):
+                self.run_child(script)
+            self.assertTrue(orphan_samples, "root EOF must not silently drop the live detached child")
+            self.assertTrue(all(info[0] == 1 for sample in orphan_samples for info in sample.values()))
+            self.assertTrue(all(info[2] > 0 for sample in orphan_samples for info in sample.values()))
+            receipt = json.loads(Path(str(self.log) + ".json").read_text())
+            self.assertEqual(receipt["exit_code"], 0)
+            ownership = receipt["ownership"]
+            self.assertGreaterEqual(ownership["settled_count"] +
+                                    sum(row["status"] == 5 for row in ownership["owned"]), 2)
+        finally:
+            # Only this fixture's previously bound Python child, never a group.
+            (self.root / "child-release").touch()
+            for pid, before in bound_child.items():
+                now = guard.process_info(pid)
+                if now is not None and now[3] == before[3] and now[4] != 5:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+    def test_refusal_snapshot_survives_cleanup_and_receipt_persistence_failure(self):
+        sample = guard.OwnedProcesses.sample
+        write = Path.write_text
+        first = True
+
+        def refuse_once(owner, deadline):
+            nonlocal first
+            if first:
+                first = False
+                owner.refuse("unbound descendant identity", 9999999, (9999998, 9999999, 1, (1, 1), 2))
+            return sample(owner, deadline)
+
+        def fail_receipt(path, text, *args, **kwargs):
+            if path.name == "stage.log.json":
+                raise OSError("fixture receipt unavailable")
+            return write(path, text, *args, **kwargs)
+
+        with patch.object(guard.OwnedProcesses, "sample", refuse_once), patch.object(Path, "write_text", fail_receipt):
+            with self.assertRaisesRegex(guard.Refusal, "unbound descendant") as caught:
+                self.run_child("import time; time.sleep(1)")
+        stage = caught.exception.primary_stage
+        self.assertIsNone(stage["exit_code"])
+        self.assertIsNone(stage["signal"])
+        self.assertEqual(stage["ownership"]["offending"]["pid"], 9999999)
+        self.assertEqual(stage["cleanup"]["observed_signal"], 9)
+        self.assertTrue(stage["cleanup"]["ownership"]["settlement_uncertain"])
+        self.assertTrue(any("cleanup not settled" in e for e in caught.exception.secondary_errors))
+        self.assertTrue(any("receipt unavailable" in e for e in caught.exception.secondary_errors))
+        self.assertLess(len(json.dumps(stage).encode()), 65536)
 
     def test_failed_job_never_seals_candidate(self):
         upload = self.root / "upload"
@@ -545,6 +630,259 @@ class QualificationTests(unittest.TestCase):
         self.assertIn("size", report["files"][self.NATIVE_FILES[0]]["error"])
         self.assertFalse((self.upload / "failed-native" / Path(self.NATIVE_FILES[0]).name).exists())
         self.assertLess(guard.upload_size(self.upload), 2 * 1024 ** 2)
+
+
+class KernelIdentityTests(unittest.TestCase):
+    def test_short_or_permission_denied_reply_is_not_absence(self):
+        for result, error in [(0, guard.errno.EPERM), (-1, guard.errno.EPERM), (231, 0)]:
+            with self.subTest(result=result, error=error):
+                def api(*args):
+                    guard.ctypes.set_errno(error)
+                    return result
+                with patch.object(guard, "process_api", return_value=api):
+                    with self.assertRaisesRegex(guard.Refusal, "unreadable kernel"):
+                        guard.process_info(10)
+
+    def test_kernel_esrch_confirms_absence(self):
+        def api(*args):
+            guard.ctypes.set_errno(guard.errno.ESRCH)
+            return 0
+        with patch.object(guard, "process_api", return_value=api):
+            self.assertIsNone(guard.process_info(10))
+
+    def test_missing_task_memory_requires_a_confirmed_zombie(self):
+        for status in (5, 2):
+            with self.subTest(status=status):
+                def api(pid, flavor, arg, buffer, size):
+                    if flavor == 2:
+                        guard.ctypes.set_errno(guard.errno.ESRCH)
+                        return 0
+                    bsd = guard.ctypes.cast(buffer, guard.ctypes.POINTER(guard._BSDInfo)).contents
+                    bsd.pid, bsd.ppid, bsd.pgid = pid, 1, pid
+                    bsd.start_sec, bsd.start_usec, bsd.status = 1000, 7, status
+                    return size
+                with patch.object(guard, "process_api", return_value=api):
+                    if status == 5:
+                        self.assertEqual(guard.process_info(10), (1, 10, 0, (1000, 7), 5))
+                    else:
+                        with self.assertRaisesRegex(guard.Refusal, "resident memory"):
+                            guard.process_info(10)
+
+    def test_mismatched_kernel_pid_is_refused(self):
+        def api(pid, flavor, arg, buffer, size):
+            info = guard.ctypes.cast(buffer, guard.ctypes.POINTER(guard._TaskAllInfo)).contents
+            info.bsd.pid, info.bsd.start_sec = pid + 1, 1000
+            return size
+        with patch.object(guard, "process_api", return_value=api):
+            with self.assertRaisesRegex(guard.Refusal, "invalid kernel"):
+                guard.process_info(10)
+
+
+class OwnershipTests(unittest.TestCase):
+    """Deterministic samples; numeric identities never refer to real host processes."""
+    def setUp(self):
+        self.info = {
+            10: (1, 10, 100, (1000, 10), 2),
+            11: (10, 11, 200, (1000, 11), 2),
+            12: (11, 11, 300, (1000, 12), 2),
+            99: (1, 99, 900, (1000, 99), 2),
+        }
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.object(guard.os, "getpid", return_value=1))
+        self.stack.enter_context(patch.object(guard, "process_info", side_effect=self.info.get))
+        self.stack.enter_context(patch.object(guard, "table", side_effect=self.rows))
+        self.owner = guard.OwnedProcesses(10)
+        self.process = Mock(pid=10)
+        self.process.poll.return_value = 0
+
+    def rows(self, **kwargs):
+        # ps is discovery only; deliberately wrong RSS cannot replace the
+        # identity-bound kernel reading. Names never supply ancestry.
+        return {pid: (r[0], r[1], 1, "coarse-second", "same-binary-sensitive-marker")
+                for pid, r in self.info.items()}
+
+    def sample(self):
+        return self.owner.sample(time.monotonic() + 2)
+
+    def test_single_and_detached_groups_use_ancestry_not_names(self):
+        live, _ = self.sample()
+        self.assertEqual(set(live), {10, 11, 12})
+        self.assertEqual(sum(r[2] for r in live.values()), 600)
+        self.assertNotIn(99, self.owner.owned)
+        snapshot = json.dumps(self.owner.snapshot())
+        self.assertNotIn("sensitive-marker", snapshot)
+        self.assertNotIn('"pid": 99', snapshot)
+        self.assertLess(len(snapshot.encode()), 65536)
+
+    def test_normal_single_group_admission(self):
+        self.info[11] = (10, 10, 200, (1000, 11), 2)
+        self.info[12] = (11, 10, 300, (1000, 12), 2)
+        self.assertEqual(set(self.sample()[0]), {10, 11, 12})
+
+    def test_reparented_identity_and_its_new_child_remain_accounted(self):
+        self.sample()
+        del self.info[10]
+        self.info[11] = (1, 11, 400, (1000, 11), 2)
+        self.info[13] = (11, 13, 500, (1000, 13), 2)
+        live, _ = self.sample()
+        self.assertEqual(set(live), {11, 12, 13})
+        self.assertEqual(sum(r[2] for r in live.values()), 1200)
+        self.assertEqual(live[11][3], (1000, 11))
+
+    def test_unobserved_group_member_is_never_admitted(self):
+        self.info[20] = (1, 10, 50, (1000, 20), 2)
+        with self.assertRaisesRegex(guard.Refusal, "unbound member"):
+            self.sample()
+        self.assertNotIn(20, self.owner.owned)
+        self.assertEqual(self.owner.snapshot()["offending"]["pid"], 20)
+
+    def test_new_child_without_parent_identity_continuity_is_refused(self):
+        rows = self.rows()
+        self.info[11] = (99, 11, 200, (1000, 11), 2)
+        with patch.object(guard, "table", return_value=rows):
+            with self.assertRaisesRegex(guard.Refusal, "unbound descendant"):
+                self.sample()
+        self.assertNotIn(11, self.owner.owned)
+        self.assertEqual(self.owner.snapshot()["offending"]["parent"], 99)
+
+    def test_parent_replacement_during_admission_is_refused(self):
+        reads = 0
+
+        def identity(pid):
+            nonlocal reads
+            if pid == 10:
+                reads += 1
+                if reads >= 3:
+                    return (1, 10, 100, (1000, 999), 2)
+            return self.info.get(pid)
+
+        with patch.object(guard, "process_info", side_effect=identity):
+            with self.assertRaisesRegex(guard.Refusal, "unbound descendant"):
+                self.sample()
+        self.assertNotIn(11, self.owner.owned)
+
+    def test_microsecond_pid_replacement_is_refused_and_never_signalled(self):
+        self.sample()
+        self.info[11] = (10, 11, 200, (1000, 999), 2)
+        with self.assertRaisesRegex(guard.Refusal, "PID identity changed"):
+            self.sample()
+        with patch.object(guard.os, "kill") as kill, patch.object(guard.os, "killpg") as killpg:
+            with self.assertRaisesRegex(guard.Refusal, "cleanup not settled"):
+                guard.stop_owned(self.process, self.owner)
+        self.assertNotIn(11, [call.args[0] for call in kill.call_args_list])
+        killpg.assert_not_called()
+        self.assertEqual(self.owner.snapshot()["offending"]["expected_birth"], (1000, 11))
+
+    def test_cleanup_revalidates_again_after_its_sample(self):
+        self.info = {10: self.info[10]}
+        original = self.owner.sample
+
+        def replacement_after_sample(deadline):
+            value = original(deadline)
+            self.info[10] = (1, 10, 100, (1000, 999), 2)
+            return value
+
+        with patch.object(guard, "process_info", side_effect=lambda pid: self.info.get(pid)):
+            with patch.object(self.owner, "sample", side_effect=replacement_after_sample):
+                with patch.object(guard.os, "kill") as kill:
+                    with self.assertRaises(guard.Refusal) as caught:
+                        guard.stop_owned(self.process, self.owner)
+        kill.assert_not_called()
+        self.assertIn("cleanup PID identity", str(caught.exception))
+
+    def test_cleanup_stops_bound_orphans_not_unrelated_processes(self):
+        self.sample()
+        del self.info[10]
+        self.info[11] = (1, 11, 200, (1000, 11), 2)
+        signalled = []
+
+        def kill(pid, sig):
+            self.assertEqual(sig, signal.SIGKILL)
+            signalled.append(pid)
+            self.info.pop(pid)
+
+        with patch.object(guard.os, "kill", side_effect=kill), patch.object(guard.os, "killpg") as killpg:
+            guard.stop_owned(self.process, self.owner)
+        self.assertEqual(set(signalled), {11, 12})
+        self.assertIn(99, self.info)
+        self.assertEqual(self.owner.owned, {})
+        killpg.assert_not_called()
+
+    def test_cleanup_failure_cannot_claim_settlement(self):
+        self.sample()
+        with patch.object(guard.os, "kill", side_effect=PermissionError("fixture signal refused")):
+            with self.assertRaisesRegex(guard.Refusal, "cleanup not settled.*signal refused"):
+                guard.stop_owned(self.process, self.owner)
+        self.assertTrue(self.owner.owned)
+
+    def test_disappearance_does_not_erase_prior_unbound_identity_gap(self):
+        self.info[20] = (1, 10, 50, (1000, 20), 2)
+        with self.assertRaises(guard.Refusal):
+            self.sample()
+        self.info.clear()
+        with patch.object(guard.os, "kill") as kill:
+            with self.assertRaisesRegex(guard.Refusal, "ownership became uncertain"):
+                guard.stop_owned(self.process, self.owner)
+        kill.assert_not_called()
+        self.assertTrue(self.owner.snapshot()["settlement_uncertain"])
+        self.assertEqual(self.owner.snapshot()["offending"]["pid"], 20)
+
+    def test_cleanup_deadline_refuses_unsettled_survivors(self):
+        self.sample()
+        clock = iter(range(100))
+        with patch.object(guard.time, "monotonic", side_effect=lambda: next(clock)):
+            with patch.object(guard.os, "kill"):
+                with self.assertRaisesRegex(guard.Refusal, "settlement deadline"):
+                    guard.stop_owned(self.process, self.owner)
+
+    def test_unreadable_sample_cannot_be_promoted_to_clean_settlement(self):
+        with patch.object(guard, "process_info", side_effect=guard.Refusal("unreadable identity")):
+            with self.assertRaisesRegex(guard.Refusal, "unreadable identity"):
+                self.sample()
+        self.info.clear()
+        with self.assertRaisesRegex(guard.Refusal, "ownership became uncertain"):
+            guard.stop_owned(self.process, self.owner)
+
+    def test_unbound_group_member_survives_cleanup_without_becoming_owned(self):
+        self.info[20] = (1, 10, 50, (1000, 20), 2)
+        with self.assertRaises(guard.Refusal):
+            self.sample()
+        with patch.object(guard.os, "kill") as kill:
+            with self.assertRaisesRegex(guard.Refusal, "cleanup not settled"):
+                guard.stop_owned(self.process, self.owner)
+        self.assertNotIn(20, [call.args[0] for call in kill.call_args_list])
+        self.assertNotIn(99, [call.args[0] for call in kill.call_args_list])
+
+    def test_process_ceiling_and_diagnostic_size_remain_bounded(self):
+        for pid in range(100, 170):
+            self.info[pid] = (10, 10, 1, (1000, pid), 2)
+        with self.assertRaisesRegex(guard.Refusal, "process-count ceiling"):
+            self.sample()
+        snapshot = self.owner.snapshot()
+        self.assertEqual(len(snapshot["owned"]), guard.PROCESS_LIMIT + 1)
+        self.assertLess(len(json.dumps(snapshot).encode()), 65536)
+        self.assertIsNotNone(snapshot["offending"])
+
+    def test_settled_zombies_are_nonexecuting_not_successful_child_exits(self):
+        self.sample()
+        del self.info[10]
+        self.info[11] = (1, 11, 0, (1000, 11), 5)
+        self.info[12] = (1, 11, 0, (1000, 12), 5)
+        self.assertEqual(self.sample()[0], {})
+        self.assertEqual(self.owner.snapshot()["owned"][0]["status"], 5)
+
+    def test_expired_deadline_does_not_start_another_sampler(self):
+        with patch.object(guard, "table") as table:
+            with self.assertRaisesRegex(guard.Refusal, "deadline"):
+                self.owner.sample(time.monotonic() - 1)
+        table.assert_not_called()
+
+    def test_sampler_timeout_is_a_refusal_with_uncertain_settlement(self):
+        with patch.object(guard, "table", side_effect=subprocess.TimeoutExpired(["ps"], 0.1)):
+            with self.assertRaisesRegex(guard.Refusal, "process sampling deadline"):
+                self.sample()
+        self.assertTrue(self.owner.snapshot()["settlement_uncertain"])
 
 
 if __name__ == "__main__":

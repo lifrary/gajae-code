@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """Control-plane wrapper only; never imports target packages or reimplements receipts."""
+import ctypes
+import errno
+from functools import lru_cache
 import hashlib
 import json
 import os
@@ -61,17 +64,17 @@ def digest(file):
     return value.hexdigest()
 
 
-def command(argv, cwd=None):
-    return subprocess.check_output(argv, cwd=cwd, text=True, timeout=10).strip()
+def command(argv, cwd=None, timeout=10):
+    return subprocess.check_output(argv, cwd=cwd, text=True, timeout=timeout).strip()
 
 
 def free_bytes(directory):
     return shutil.disk_usage(directory).free
 
 
-def table():
+def table(timeout=10):
     rows = {}
-    text = command(["ps", "-axo", "pid=,ppid=,pgid=,rss=,lstart=,comm="])
+    text = command(["ps", "-axo", "pid=,ppid=,pgid=,rss=,lstart=,comm="], timeout=timeout)
     for line in text.splitlines():
         parts = line.split(None, 9)
         if len(parts) != 10:
@@ -81,40 +84,207 @@ def table():
     return rows
 
 
-def owned_tree(pid, rows):
-    owned = {p for p, row in rows.items() if p == pid or row[1] == pid}
-    while True:
-        children = {p for p, row in rows.items() if row[0] in owned}
-        enlarged = owned | children
-        if enlarged == owned:
-            return {p: rows[p] for p in owned}
-        owned = enlarged
+class _BSDInfo(ctypes.Structure):
+    # Public Darwin sys/proc_info.h: PROC_PIDTBSDINFO, MAXCOMLEN=16.
+    _fields_ = [(name, ctypes.c_uint32) for name in (
+        "flags", "status", "xstatus", "pid", "ppid", "uid", "gid",
+        "ruid", "rgid", "svuid", "svgid", "reserved",
+    )] + [("comm", ctypes.c_char * 16), ("name", ctypes.c_char * 32)] + [
+        (name, ctypes.c_uint32) for name in ("nfiles", "pgid", "pjobc", "tdev", "tpgid")
+    ] + [("nice", ctypes.c_int32), ("start_sec", ctypes.c_uint64),
+         ("start_usec", ctypes.c_uint64)]
 
 
-def stop_owned(process, observed):
-    # Only this wrapper's isolated subprocess group and observed descendants.
-    # Revalidate birth/parent/group before signalling an escaped descendant.
-    pid = process.pid
-    try:
-        current = table()
-        # Descendants first: killing the root first can reparent an escaped
-        # process and invalidate the very identity used to clean it up.
-        for child, before in reversed(list(observed.items())):
-            if child == pid:
+class _TaskInfo(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_uint64) for name in (
+        "virtual", "resident", "total_user", "total_system", "threads_user", "threads_system",
+    )] + [(name, ctypes.c_int32) for name in (
+        "policy", "faults", "pageins", "cow_faults", "messages_sent", "messages_received",
+        "syscalls_mach", "syscalls_unix", "csw", "threadnum", "numrunning", "priority",
+    )]
+
+
+class _TaskAllInfo(ctypes.Structure):
+    _fields_ = [("bsd", _BSDInfo), ("task", _TaskInfo)]
+
+
+@lru_cache(maxsize=1)
+def process_api():
+    if platform.system() != "Darwin":
+        raise Refusal("Darwin kernel process identity required")
+    if (ctypes.sizeof(_BSDInfo), ctypes.sizeof(_TaskInfo), ctypes.sizeof(_TaskAllInfo)) != (136, 96, 232):
+        raise Refusal("unexpected Darwin process-info layout")
+    api = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True).proc_pidinfo
+    api.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
+    api.restype = ctypes.c_int
+    return api
+
+
+def process_info(pid):
+    """Kernel-bound (parent, group, RSS, microsecond birth, status), never argv/env."""
+    def read(flavor, value):
+        ctypes.set_errno(0)
+        size = ctypes.sizeof(value)
+        result = process_api()(pid, flavor, 0, ctypes.byref(value), size)
+        if result == size:
+            return value
+        if result == 0 and ctypes.get_errno() == errno.ESRCH:
+            return None
+        raise Refusal(f"unreadable kernel process identity for pid {pid}")
+
+    info = read(2, _TaskAllInfo())  # PROC_PIDTASKALLINFO binds RSS to this process.
+    if info is not None:
+        bsd, rss = info.bsd, info.task.resident
+    else:
+        bsd = read(3, _BSDInfo())
+        if bsd is None:
+            return None
+        if bsd.status != 5:  # SZOMB: non-executing, awaiting its parent's wait.
+            raise Refusal(f"unreadable resident memory for pid {pid}")
+        rss = 0
+    if bsd.pid != pid or not bsd.start_sec or bsd.start_usec >= 1000000:
+        raise Refusal(f"invalid kernel process identity for pid {pid}")
+    return (bsd.ppid, bsd.pgid, rss, (bsd.start_sec, bsd.start_usec), bsd.status)
+
+
+class OwnedProcesses:
+    """Sampled ancestry admission; a PGID or name never grants ownership.
+
+    A child born and reparented between samples can escape discovery entirely.
+    This is cooperative accounting, not kernel-total containment or atomic signalling.
+    """
+    def __init__(self, pid):
+        root = process_info(pid)
+        if root is None or root[0] != os.getpid() or root[1] != pid:
+            raise Refusal("cannot bind newly spawned root identity")
+        self.root = pid
+        self.owned = {pid: root}
+        self.groups = {root[1]}
+        self.offending = None
+        self.uncertain = False
+        self.settled = 0
+
+    def refuse(self, reason, pid, info, expected=None):
+        self.uncertain = True
+        self.offending = {"pid": pid, "parent": info[0], "group": info[1],
+                          "birth": info[3], "status": info[4], "reason": reason,
+                          "expected_birth": expected}
+        raise Refusal(reason)
+
+    def snapshot(self):
+        # At most 64 admitted live processes plus the process that exceeds the cap.
+        return {"root_pid": self.root, "identity": "pid + kernel start_sec/start_usec",
+                "sampled_only": True, "settled_count": self.settled,
+                "settlement_uncertain": self.uncertain,
+                "observed_groups": sorted(self.groups)[:PROCESS_LIMIT + 1],
+                "owned": [{"pid": pid, "parent": row[0], "group": row[1], "rss": row[2],
+                           "birth": row[3], "status": row[4]}
+                          for pid, row in list(self.owned.items())[:PROCESS_LIMIT + 1]],
+                "offending": self.offending}
+
+    def sample(self, deadline):
+        try:
+            return self._sample(deadline)
+        except Exception:
+            self.uncertain = True
+            raise
+
+    def _sample(self, deadline):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise Refusal("stage or whole-job deadline reached")
+        try:
+            rows = table(timeout=min(10, remaining))
+        except subprocess.TimeoutExpired as error:
+            raise Refusal("process sampling deadline reached") from error
+        for pid, before in list(self.owned.items()):
+            current = process_info(pid)
+            if current is None:
+                del self.owned[pid]
+                self.settled += 1
+            elif current[3] != before[3]:
+                self.refuse("owned PID identity changed", pid, current, before[3])
+            else:
+                # Once ancestry is proved, the SAME process stays owned after
+                # setsid, reparenting or root exit. Its new parent is not owned.
+                self.owned[pid] = current
+        while True:
+            added = False
+            for pid, row in rows.items():
+                if pid in self.owned or row[0] not in self.owned:
+                    continue
+                if time.monotonic() >= deadline:
+                    raise Refusal("stage or whole-job deadline reached")
+                parent = row[0]
+                bound = self.owned[parent]
+                before = process_info(parent)
+                child = process_info(pid)
+                after = process_info(parent)
+                if child is None or child[4] == 5:
+                    continue
+                if (before is None or after is None or before[4] == 5 or after[4] == 5 or
+                        before[3] != bound[3] or after[3] != bound[3] or child[0] != parent):
+                    self.refuse("unbound descendant identity", pid, child)
+                if len(self.owned) >= PROCESS_LIMIT + 1:
+                    self.refuse("sampled process-tree memory or process-count ceiling reached", pid, child)
+                self.owned[pid] = child
+                added = True
+                if len(self.owned) > PROCESS_LIMIT:
+                    self.refuse("sampled process-tree memory or process-count ceiling reached", pid, child)
+            if not added:
+                break
+        self.groups.update(row[1] for row in self.owned.values())
+        if len(self.groups) > PROCESS_LIMIT:
+            self.uncertain = True
+            raise Refusal("observed process-group inventory ceiling reached")
+        for pid, row in rows.items():
+            if pid in self.owned or row[1] not in self.groups:
                 continue
-            now = current.get(child)
-            if not now or (now[0], now[1], now[3]) != (before[0], before[1], before[3]):
-                continue
-            try:
-                os.kill(child, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-    finally:
+            current = process_info(pid)
+            if current is not None and current[4] != 5 and current[1] in self.groups:
+                self.refuse("unbound member of an observed process group", pid, current)
+        live = {pid: row for pid, row in self.owned.items() if row[4] != 5}
+        executables = {rows[pid][4] for pid in live if pid in rows}
+        return live, executables
+
+
+def stop_owned(process, ownership):
+    # No group signal: a group can contain a process we never bound. A fresh
+    # birth check narrows (but cannot atomically eliminate) the check/signal race.
+    if ownership is None:
         if process.poll() is None:
+            process.kill()  # Our unreaped direct child only; never an inferred PID.
+        raise Refusal("ownership unavailable; descendant settlement unknown")
+    deadline = time.monotonic() + 5
+    errors = []
+    while time.monotonic() < deadline:
+        try:
+            live, _ = ownership.sample(deadline)
+        except Exception as error:
+            errors.append(str(error)[:256])
+            live = ownership.owned
+        if not live:
+            if errors or ownership.uncertain:
+                raise Refusal("owned cleanup not settled: " +
+                              "; ".join(errors[:4] or ["sampled ownership became uncertain"]))
+            return
+        for pid, bound in reversed(list(ownership.owned.items())):
             try:
-                os.killpg(pid, signal.SIGKILL)
+                current = process_info(pid)
+                if current is None or current[4] == 5:
+                    continue
+                if current[3] != bound[3]:
+                    raise Refusal(f"cleanup PID identity changed: {pid}")
+                os.kill(pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+            except Exception as error:
+                errors.append(str(error)[:256])
+        process.poll()
+        if errors:
+            raise Refusal("owned cleanup not settled: " + "; ".join(errors[:4]))
+        time.sleep(0.02)
+    raise Refusal("owned cleanup settlement deadline reached")
 
 
 def enforce_capacity(root, initial_free):
@@ -280,7 +450,7 @@ def retain_native_failure(source, root, error):
 
 def run_stage(argv, cwd, log, env, deadline, initial_free, rss_limit=RSS_LIMIT, log_limit=LOG_LIMIT):
     process = None
-    observed = {}
+    ownership = None
     peak_rss = 0
     peak_processes = 0
     executables = set()
@@ -291,7 +461,7 @@ def run_stage(argv, cwd, log, env, deadline, initial_free, rss_limit=RSS_LIMIT, 
     secondary_errors = []
     selector = None
     stage = {
-        "argv": list(argv), "process_started": False,
+        "argv": list(argv), "process_started": False, "root_pid": None,
         "exit_code": None, "signal": None, "failure_cause": None,
         "cleanup": {"attempted": False, "observed_exit_code": None, "observed_signal": None},
     }
@@ -302,6 +472,8 @@ def run_stage(argv, cwd, log, env, deadline, initial_free, rss_limit=RSS_LIMIT, 
         code = process.returncode if process is not None else None
         stage.update(exit_code=code, signal=-code if code is not None and code < 0 else None,
                      failure_cause=str(error)[:1024])
+        if ownership is not None:
+            stage["ownership"] = ownership.snapshot()
         error.primary_stage = stage
         error.secondary_errors = secondary_errors
 
@@ -313,24 +485,29 @@ def run_stage(argv, cwd, log, env, deadline, initial_free, rss_limit=RSS_LIMIT, 
         process = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, start_new_session=True)
         stage["process_started"] = True
+        stage["root_pid"] = process.pid
+        ownership = OwnedProcesses(process.pid)
         selector.register(process.stdout, selectors.EVENT_READ)
         with Path(log).open("xb") as output:
             eof = False
-            while process.poll() is None or not eof:
+            while True:
+                code = process.poll()
                 now = time.monotonic()
                 if now >= deadline:
                     raise Refusal("stage or whole-job deadline reached")
                 enforce_capacity(cwd, initial_free)
-                observed = owned_tree(process.pid, table())
-                executables.update(row[4] for row in observed.values())
+                observed, names = ownership.sample(deadline)
+                executables.update(names)
                 if len(executables) > 128:
                     raise Refusal("observed executable inventory ceiling reached")
-                peak_rss = max(peak_rss, sum(row[2] for row in observed.values()))
-                peak_processes = max(peak_processes, len(observed))
-                if any(row[1] != process.pid for row in observed.values()):
-                    raise Refusal("subprocess escaped its owned process group")
-                if peak_rss > rss_limit or len(observed) > PROCESS_LIMIT:
+                peak_rss = max(peak_rss, sum(row[2] for row in ownership.owned.values()))
+                peak_processes = max(peak_processes, len(ownership.owned))
+                if peak_rss > rss_limit or len(ownership.owned) > PROCESS_LIMIT:
                     raise Refusal("sampled process-tree memory or process-count ceiling reached")
+                if code is not None and code != 0 and eof:
+                    raise Refusal("command failed; no retry permitted")
+                if code is not None and eof and not observed:
+                    break
                 for key, _ in selector.select(timeout=0.25):
                     block = os.read(key.fd, 65536)
                     if not block:
@@ -343,7 +520,7 @@ def run_stage(argv, cwd, log, env, deadline, initial_free, rss_limit=RSS_LIMIT, 
                     written += len(block)
             if process.wait(timeout=2) != 0:
                 raise Refusal("command failed; no retry permitted")
-            observed = owned_tree(process.pid, table())
+            observed, _ = ownership.sample(deadline)
             if observed:
                 raise Refusal("descendants remained after stage exit")
     except BaseException as error:
@@ -353,7 +530,7 @@ def run_stage(argv, cwd, log, env, deadline, initial_free, rss_limit=RSS_LIMIT, 
         if process is not None:
             stage["cleanup"]["attempted"] = True
             try:
-                stop_owned(process, observed)
+                stop_owned(process, ownership)
             except Exception as cleanup:
                 secondary_errors.append("owned cleanup: " + str(cleanup)[:512])
             try:
@@ -363,6 +540,8 @@ def run_stage(argv, cwd, log, env, deadline, initial_free, rss_limit=RSS_LIMIT, 
             code = process.returncode
             stage["cleanup"].update(observed_exit_code=code,
                                     observed_signal=-code if code is not None and code < 0 else None)
+            if ownership is not None:
+                stage["cleanup"]["ownership"] = ownership.snapshot()
         raise
     finally:
         for close in ([selector.close] if selector is not None else []) + (
@@ -378,6 +557,7 @@ def run_stage(argv, cwd, log, env, deadline, initial_free, rss_limit=RSS_LIMIT, 
             "observed_executables": sorted(executables),
             "cleanup_errors": secondary_errors,
             "primary_stage": stage if primary is not None else None,
+            "ownership": ownership.snapshot() if ownership is not None else None,
         }
         try:
             Path(str(log) + ".json").write_text(json.dumps(receipt, indent=2) + "\n")
